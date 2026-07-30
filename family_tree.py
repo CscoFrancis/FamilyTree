@@ -95,6 +95,10 @@ elif data_source == "Google Sheet (private)":
     )
     sheet_url = st.sidebar.text_input("Google Sheet URL", key="private_sheet_url")
 
+    # Default file
+    if not sheet_url:
+        sheet_url = "https://docs.google.com/spreadsheets/d/1GGMarbxQ7XNC5qcUO_3iIWdcGMP27V4OETGRaWEBMgk/edit?gid=0#gid=0"
+
     if sheet_url:
         try:
             file_id, gid = parse_sheet_url(sheet_url)
