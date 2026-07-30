@@ -139,5 +139,6 @@ if children:
 else:
     st.write("**Children:** None")
 # -------------------------------------------------------------------------------
+st.didivider()
 st.subheader("Raw Data")
 st.dataframe(df, use_container_width=True)
