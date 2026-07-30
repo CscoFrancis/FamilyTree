@@ -1,5 +1,5 @@
-streamlit
-pandas
-gspread
-google-auth
-openpyxl
+streamlit>=1.30
+pandas>=2.0
+openpyxl>=3.1
+gspread>=6.0
+google-auth>=2.25
