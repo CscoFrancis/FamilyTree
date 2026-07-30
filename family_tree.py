@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import pandas as pd
 
@@ -7,7 +8,8 @@ st.title("🌳 Family Tree Viewer")
 
 st.markdown(
     """
-    Upload a CSV/Excel file (or use the sample data) with the columns:
+    Load your data from a Google Sheet, upload a CSV/Excel file, or use the sample data.
+    Your data should have the columns:
     **ID, Name, Age, ParentID**
 
     - `ID`: unique identifier for each person
@@ -36,15 +38,60 @@ sample_data = pd.DataFrame(
 # Sidebar: data input
 # ---------------------------------------------------------------------------
 st.sidebar.header("Data Input")
-uploaded_file = st.sidebar.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
 
-if uploaded_file is not None:
-    if uploaded_file.name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
+data_source = st.sidebar.radio(
+    "Choose data source", options=["Google Sheet", "Upload CSV/Excel", "Sample data"]
+)
+
+df = None
+
+if data_source == "Google Sheet":
+    st.sidebar.markdown(
+        "Paste a Google Sheets URL. The sheet must be shared as "
+        "**\"Anyone with the link can view\"**."
+    )
+    sheet_url = st.sidebar.text_input("Google Sheet URL")
+
+    if sheet_url:
+        try:
+            # Extract the file ID and, if present, the gid (specific tab)
+            # from a typical Google Sheets URL, e.g.:
+            # https://docs.google.com/spreadsheets/d/<FILE_ID>/edit#gid=<GID>
+            match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_url)
+            if not match:
+                st.sidebar.error("Couldn't parse a Google Sheet ID from that URL.")
+            else:
+                file_id = match.group(1)
+                gid_match = re.search(r"[?#&]gid=(\d+)", sheet_url)
+                gid = gid_match.group(1) if gid_match else "0"
+
+                csv_url = (
+                    f"https://docs.google.com/spreadsheets/d/{file_id}"
+                    f"/export?format=csv&gid={gid}"
+                )
+                df = pd.read_csv(csv_url)
+        except Exception as e:
+            st.sidebar.error(
+                "Couldn't load that sheet. Make sure it's shared as "
+                f"'Anyone with the link can view'. Error: {e}"
+            )
+
+    if df is None:
+        st.sidebar.info("No sheet loaded yet — using sample data.")
+        df = sample_data.copy()
+
+elif data_source == "Upload CSV/Excel":
+    uploaded_file = st.sidebar.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
+    if uploaded_file is not None:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
     else:
-        df = pd.read_excel(uploaded_file)
+        st.sidebar.info("No file uploaded — using sample data.")
+        df = sample_data.copy()
+
 else:
-    st.sidebar.info("No file uploaded — using sample data.")
     df = sample_data.copy()
 
 # ---------------------------------------------------------------------------
@@ -139,8 +186,6 @@ if children:
 else:
     st.write("**Children:** None")
 # -------------------------------------------------------------------------------
-st.markdown("<br>", unsafe_allow_html=True)
 st.divider()
-st.markdown("<br>", unsafe_allow_html=True)
 st.subheader("Raw Data")
 st.dataframe(df, use_container_width=True)
