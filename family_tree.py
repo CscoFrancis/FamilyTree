@@ -90,7 +90,7 @@ if data_source == "Google Sheet (public)":
 
 elif data_source == "Google Sheet (private)":
     st.sidebar.markdown(
-        "Requires a service account configured in `st.secrets['gcp_service_account']`, "
+        "Requires a service account configured in `st.secrets['connections']['gsheets']`, "
         "and the sheet shared with that service account's email (Viewer access)."
     )
     sheet_url = st.sidebar.text_input("Google Sheet URL", key="private_sheet_url")
@@ -100,9 +100,9 @@ elif data_source == "Google Sheet (private)":
             file_id, gid = parse_sheet_url(sheet_url)
             if not file_id:
                 st.sidebar.error("Couldn't parse a Google Sheet ID from that URL.")
-            elif "gcp_service_account" not in st.secrets:
+            elif "connections" not in st.secrets or "gsheets" not in st.secrets["connections"]:
                 st.sidebar.error(
-                    "No service account found in st.secrets['gcp_service_account']. "
+                    "No service account found in st.secrets['connections']['gsheets']. "
                     "See the app documentation for setup steps."
                 )
             else:
@@ -110,8 +110,13 @@ elif data_source == "Google Sheet (private)":
                     "https://www.googleapis.com/auth/spreadsheets.readonly",
                     "https://www.googleapis.com/auth/drive.readonly",
                 ]
+                service_account_info = dict(st.secrets["connections"]["gsheets"])
+                # The connections.gsheets block includes a "type" key used by
+                # some connectors; Credentials only wants the service-account fields.
+                service_account_info.pop("type", None)
+
                 creds = Credentials.from_service_account_info(
-                    st.secrets["gcp_service_account"], scopes=scopes
+                    service_account_info, scopes=scopes
                 )
                 client = gspread.authorize(creds)
                 spreadsheet = client.open_by_key(file_id)
