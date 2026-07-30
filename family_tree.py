@@ -1,6 +1,8 @@
 import re
 import streamlit as st
 import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Family Tree Viewer", layout="wide")
 
@@ -8,7 +10,7 @@ st.title("🌳 Family Tree Viewer")
 
 st.markdown(
     """
-    Load your data from a Google Sheet, upload a CSV/Excel file, or use the sample data.
+    Load your data from a Google Sheet (public or private), upload a CSV/Excel file, or use the sample data.
     Your data should have the columns:
     **ID, Name, Age, ParentID**
 
@@ -40,31 +42,37 @@ sample_data = pd.DataFrame(
 st.sidebar.header("Data Input")
 
 data_source = st.sidebar.radio(
-    "Choose data source", options=["Google Sheet", "Upload CSV/Excel", "Sample data"]
+    "Choose data source",
+    options=["Google Sheet (public)", "Google Sheet (private)", "Upload CSV/Excel", "Sample data"],
 )
 
 df = None
 
-if data_source == "Google Sheet":
+
+def parse_sheet_url(url):
+    """Extract the file ID and gid (tab) from a Google Sheets URL."""
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+    if not match:
+        return None, None
+    file_id = match.group(1)
+    gid_match = re.search(r"[?#&]gid=(\d+)", url)
+    gid = gid_match.group(1) if gid_match else "0"
+    return file_id, gid
+
+
+if data_source == "Google Sheet (public)":
     st.sidebar.markdown(
         "Paste a Google Sheets URL. The sheet must be shared as "
         "**\"Anyone with the link can view\"**."
     )
-    sheet_url = st.sidebar.text_input("Google Sheet URL")
+    sheet_url = st.sidebar.text_input("Google Sheet URL", key="public_sheet_url")
 
     if sheet_url:
         try:
-            # Extract the file ID and, if present, the gid (specific tab)
-            # from a typical Google Sheets URL, e.g.:
-            # https://docs.google.com/spreadsheets/d/<FILE_ID>/edit#gid=<GID>
-            match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_url)
-            if not match:
+            file_id, gid = parse_sheet_url(sheet_url)
+            if not file_id:
                 st.sidebar.error("Couldn't parse a Google Sheet ID from that URL.")
             else:
-                file_id = match.group(1)
-                gid_match = re.search(r"[?#&]gid=(\d+)", sheet_url)
-                gid = gid_match.group(1) if gid_match else "0"
-
                 csv_url = (
                     f"https://docs.google.com/spreadsheets/d/{file_id}"
                     f"/export?format=csv&gid={gid}"
@@ -74,6 +82,55 @@ if data_source == "Google Sheet":
             st.sidebar.error(
                 "Couldn't load that sheet. Make sure it's shared as "
                 f"'Anyone with the link can view'. Error: {e}"
+            )
+
+    if df is None:
+        st.sidebar.info("No sheet loaded yet — using sample data.")
+        df = sample_data.copy()
+
+elif data_source == "Google Sheet (private)":
+    st.sidebar.markdown(
+        "Requires a service account configured in `st.secrets['gcp_service_account']`, "
+        "and the sheet shared with that service account's email (Viewer access)."
+    )
+    sheet_url = st.sidebar.text_input("Google Sheet URL", key="private_sheet_url")
+
+    if sheet_url:
+        try:
+            file_id, gid = parse_sheet_url(sheet_url)
+            if not file_id:
+                st.sidebar.error("Couldn't parse a Google Sheet ID from that URL.")
+            elif "gcp_service_account" not in st.secrets:
+                st.sidebar.error(
+                    "No service account found in st.secrets['gcp_service_account']. "
+                    "See the app documentation for setup steps."
+                )
+            else:
+                scopes = [
+                    "https://www.googleapis.com/auth/spreadsheets.readonly",
+                    "https://www.googleapis.com/auth/drive.readonly",
+                ]
+                creds = Credentials.from_service_account_info(
+                    st.secrets["gcp_service_account"], scopes=scopes
+                )
+                client = gspread.authorize(creds)
+                spreadsheet = client.open_by_key(file_id)
+
+                # Match the worksheet by gid if we found one in the URL,
+                # otherwise fall back to the first sheet.
+                worksheet = None
+                for ws in spreadsheet.worksheets():
+                    if str(ws.id) == gid:
+                        worksheet = ws
+                        break
+                if worksheet is None:
+                    worksheet = spreadsheet.sheet1
+
+                df = pd.DataFrame(worksheet.get_all_records())
+        except Exception as e:
+            st.sidebar.error(
+                "Couldn't load that sheet. Make sure it's shared with your "
+                f"service account's email with at least Viewer access. Error: {e}"
             )
 
     if df is None:
