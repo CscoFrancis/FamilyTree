@@ -381,11 +381,19 @@ else:
                                 st.error(f"Couldn't update person: {e}")
 
     with delete_tab:
+        deletable_df = df[df["ParentID"].notna()]
         if df.empty:
             st.write("No people to delete yet.")
+        elif deletable_df.empty:
+            st.write(
+                "Only root ancestors remain — they can't be deleted, only edited."
+            )
         else:
-            delete_name = st.selectbox("Select a person to delete", options=df["Name"].tolist(), key="delete_select")
-            delete_row = df[df["Name"] == delete_name].iloc[0]
+            st.caption("Root ancestors can't be deleted here — edit them instead.")
+            delete_name = st.selectbox(
+                "Select a person to delete", options=deletable_df["Name"].tolist(), key="delete_select"
+            )
+            delete_row = deletable_df[deletable_df["Name"] == delete_name].iloc[0]
             has_children = not df[df["ParentID"] == delete_row["ID"]].empty
             if has_children:
                 st.warning(
@@ -393,16 +401,21 @@ else:
                     "those children without a parent (they'll become roots)."
                 )
             if st.button("Delete person", type="primary"):
-                row_num = row_number_for_id(worksheet, header, delete_row["ID"])
-                if row_num is None:
-                    st.error("Couldn't locate that row in the sheet.")
+                if pd.isna(delete_row["ParentID"]):
+                    # Shouldn't be reachable since roots are excluded from the
+                    # dropdown above, but guard against a stale selection anyway.
+                    st.error("Root ancestors can't be deleted — edit them instead.")
                 else:
-                    try:
-                        delete_person(worksheet, row_num)
-                        st.success(f"Deleted {delete_name}.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Couldn't delete person: {e}")
+                    row_num = row_number_for_id(worksheet, header, delete_row["ID"])
+                    if row_num is None:
+                        st.error("Couldn't locate that row in the sheet.")
+                    else:
+                        try:
+                            delete_person(worksheet, row_num)
+                            st.success(f"Deleted {delete_name}.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Couldn't delete person: {e}")
 
 # ---------------------------------------------------------------------------
 # Build the tree recursively
