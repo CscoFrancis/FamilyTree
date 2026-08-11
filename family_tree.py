@@ -13,19 +13,6 @@ st.markdown(
     """
     Data is loaded live from a private Google Sheet and can be edited
     directly from this app (add, update, or remove people).
-
-    Your sheet should have the columns:
-    **ID, Name, Age, ParentID, Gender, EmploymentStatus, City, MaritalStatus, Spouse**
-
-    - `ID`: unique identifier for each person
-    - `Name`: person's name
-    - `Age`: person's age
-    - `ParentID`: the `ID` of this person's parent (leave blank / use 0 or -1 for root ancestors)
-    - `Gender`: e.g. Male, Female, Other
-    - `EmploymentStatus`: Student, Self-employed, Employed, or Unemployed
-    - `City`: city of residence
-    - `MaritalStatus`: Married, Not yet married, Divorced, or Widowed
-    - `Spouse`: spouse's name (only relevant when MaritalStatus is Married)
     """
 )
 
