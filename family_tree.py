@@ -41,7 +41,7 @@ REQUIRED_COLS = [
     "ID", "Name", "Age", "ParentID",
     "Gender", "EmploymentStatus", "City", "MaritalStatus", "Spouse",
 ]
-GENDER_OPTIONS = ["Male", "Female", "Other"]
+GENDER_OPTIONS = ["Male", "Female"]
 EMPLOYMENT_OPTIONS = ["Student", "Self-employed", "Employed", "Unemployed"]
 MARITAL_OPTIONS = ["Not yet married", "Married", "Divorced", "Widowed"]
 
