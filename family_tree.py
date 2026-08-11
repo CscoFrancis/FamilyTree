@@ -11,8 +11,10 @@ st.title("🌳 Family Tree Viewer")
 
 st.markdown(
     """
-    Data is loaded live from a private Google Sheet and can be edited
-    directly from this app (add, update, or remove people).
+    Data is loaded live and can be edited directly from this app (add, update, or remove people). 
+    
+    To perform these tasks, please request the passcode from the admin 
+
     """
 )
 
@@ -518,5 +520,5 @@ else:
 
 # ---------------------------------------------------------------------------
 st.divider()
-# st.subheader("Raw Data")
-# st.dataframe(df, use_container_width=True)
+st.subheader("Tabular Data")
+st.dataframe(df, use_container_width=True)
