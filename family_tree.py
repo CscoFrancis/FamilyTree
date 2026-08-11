@@ -217,6 +217,15 @@ def marital_clause(marital_status, spouse):
         return f"Married to {spouse}" if spouse else "Married"
     return marital_status if marital_status else "Not yet married"
 
+# A "root" is anyone with no ParentID. We cap this at two so the tree always
+# has a single top-level couple (or one root ancestor) instead of sprawling
+# into multiple unrelated trees.
+ROOT_LIMIT = 2
+
+
+def current_root_count(dframe):
+    return int(dframe["ParentID"].isna().sum())
+
 # ---------------------------------------------------------------------------
 # Sidebar: CRUD — manage people
 # ---------------------------------------------------------------------------
@@ -252,7 +261,7 @@ else:
             st.session_state.editing_unlocked = False
             st.rerun()
 
-    name_options = ["None (root)"] + df["Name"].tolist()
+    name_options = df["Name"].tolist()
 
     add_tab, edit_tab, delete_tab = st.sidebar.tabs(["➕ Add", "✏️ Edit", "🗑️ Delete"])
 
@@ -263,7 +272,16 @@ else:
             st.caption(f"ID will be auto-assigned: **{next_id}**")
             new_name = st.text_input("Name")
             new_age = st.number_input("Age", min_value=0, max_value=130, value=30, step=1)
-            new_parent = st.selectbox("Parent", options=name_options, key="add_parent")
+            root_count = current_root_count(df)
+            add_parent_options = name_options.copy()
+            if root_count < ROOT_LIMIT:
+                add_parent_options = ["None (root)"] + add_parent_options
+            else:
+                st.caption(
+                    f"Root limit reached ({ROOT_LIMIT} root ancestors already set) — "
+                    "new people must be assigned a parent."
+                )
+            new_parent = st.selectbox("Parent", options=add_parent_options, key="add_parent")
             new_gender = st.selectbox("Gender", options=GENDER_OPTIONS, key="add_gender")
             new_employment = st.selectbox("Employment status", options=EMPLOYMENT_OPTIONS, key="add_employment")
             new_city = st.text_input("City", key="add_city")
@@ -273,6 +291,10 @@ else:
             if submitted:
                 if not new_name.strip():
                     st.warning("Name is required.")
+                elif new_parent == "None (root)" and current_root_count(df) >= ROOT_LIMIT:
+                    # Re-check at submit time in case the sheet changed since the
+                    # form was rendered (e.g. someone else added a root in between).
+                    st.error(f"Only {ROOT_LIMIT} root ancestors are allowed. Please choose a parent.")
                 else:
                     # Re-derive the next ID at submit time in case the sheet changed
                     # since the form was rendered.
@@ -304,13 +326,26 @@ else:
                     value=int(edit_row["Age"]) if pd.notna(edit_row["Age"]) else 0, step=1,
                 )
                 current_parent_name = "None (root)"
-                if pd.notna(edit_row["ParentID"]):
+                is_currently_root = pd.isna(edit_row["ParentID"])
+                if not is_currently_root:
                     match = df[df["ID"] == edit_row["ParentID"]]
                     if not match.empty:
                         current_parent_name = match.iloc[0]["Name"]
+                allow_root_option = is_currently_root or (current_root_count(df) < ROOT_LIMIT)
                 parent_choices = [n for n in name_options if n != edit_name]
+                if allow_root_option:
+                    parent_choices = ["None (root)"] + parent_choices
+                elif current_parent_name == "None (root)":
+                    # Shouldn't happen (is_currently_root already covers this), but
+                    # guard against an inconsistent default_index lookup below.
+                    current_parent_name = parent_choices[0] if parent_choices else "None (root)"
                 default_index = parent_choices.index(current_parent_name) if current_parent_name in parent_choices else 0
                 edited_parent = st.selectbox("Parent", options=parent_choices, index=default_index, key="edit_parent")
+                if not allow_root_option:
+                    st.caption(
+                        f"Root limit reached ({ROOT_LIMIT} root ancestors already set) — "
+                        "this person must have a parent."
+                    )
 
                 gender_index = GENDER_OPTIONS.index(edit_row["Gender"]) if edit_row["Gender"] in GENDER_OPTIONS else 0
                 edited_gender = st.selectbox("Gender", options=GENDER_OPTIONS, index=gender_index, key="edit_gender")
@@ -334,23 +369,27 @@ else:
 
                 save = st.form_submit_button("Save changes")
                 if save:
-                    parent_id = None
-                    if edited_parent != "None (root)":
-                        parent_id = df.loc[df["Name"] == edited_parent, "ID"].iloc[0]
-                    spouse_val = edited_spouse.strip() if edited_marital == "Married" else ""
-                    row_num = row_number_for_id(worksheet, header, edit_row["ID"])
-                    if row_num is None:
-                        st.error("Couldn't locate that row in the sheet.")
+                    would_be_new_root = edited_parent == "None (root)" and not is_currently_root
+                    if would_be_new_root and current_root_count(df) >= ROOT_LIMIT:
+                        st.error(f"Only {ROOT_LIMIT} root ancestors are allowed. Please choose a parent.")
                     else:
-                        try:
-                            update_person(
-                                worksheet, header, row_num, edited_name.strip(), edited_age, parent_id,
-                                edited_gender, edited_employment, edited_city.strip(), edited_marital, spouse_val,
-                            )
-                            st.success(f"Updated {edited_name}.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Couldn't update person: {e}")
+                        parent_id = None
+                        if edited_parent != "None (root)":
+                            parent_id = df.loc[df["Name"] == edited_parent, "ID"].iloc[0]
+                        spouse_val = edited_spouse.strip() if edited_marital == "Married" else ""
+                        row_num = row_number_for_id(worksheet, header, edit_row["ID"])
+                        if row_num is None:
+                            st.error("Couldn't locate that row in the sheet.")
+                        else:
+                            try:
+                                update_person(
+                                    worksheet, header, row_num, edited_name.strip(), edited_age, parent_id,
+                                    edited_gender, edited_employment, edited_city.strip(), edited_marital, spouse_val,
+                                )
+                                st.success(f"Updated {edited_name}.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Couldn't update person: {e}")
 
     with delete_tab:
         if df.empty:
@@ -400,7 +439,7 @@ root_rows = [
 # If there are exactly two root ancestors, treat them as married to each other
 # automatically — no need to fill in MaritalStatus/Spouse for them by hand.
 auto_marital = {}
-if len(root_rows) == 2:
+if len(root_rows) == ROOT_LIMIT:
     r1, r2 = root_rows
     auto_marital[r1["ID"]] = ("Married", r2["Name"])
     auto_marital[r2["ID"]] = ("Married", r1["Name"])
