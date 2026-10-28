@@ -31,7 +31,7 @@ except Exception:
     COOKIE_SECRET = None
 
 COOKIE_NAME = "ft_auth"
-REMEMBER_DAYS = 7
+REMEMBER_DAYS = 2
 
 if not PASSCODE:
     st.title(APP_TITLE)
