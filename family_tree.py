@@ -1,4 +1,8 @@
+import hashlib
+import hmac
 import re
+import time
+from html import escape as esc
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -7,14 +11,143 @@ from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Family Tree Viewer", layout="wide")
 
-st.title("🌳 Family Tree Viewer")
+APP_TITLE = "🌳 Family Tree Viewer"
+
+# ---------------------------------------------------------------------------
+# Passcode gate: nothing below this block runs (no data is even fetched from
+# the sheet) until the correct passcode has been entered.
+# ---------------------------------------------------------------------------
+try:
+    PASSCODE = st.secrets["auth"]["passcode"]
+except Exception:  # no secrets file, no [auth] block, or no passcode key
+    PASSCODE = None
+
+# Optional: a long random string that signs the "remember me" cookie. Without
+# it the app still works, but users must re-enter the passcode after a refresh.
+# Generate one with:  python -c "import secrets; print(secrets.token_hex(32))"
+try:
+    COOKIE_SECRET = st.secrets["auth"]["cookie_secret"]
+except Exception:
+    COOKIE_SECRET = None
+
+COOKIE_NAME = "ft_auth"
+REMEMBER_DAYS = 7
+
+if not PASSCODE:
+    st.title(APP_TITLE)
+    st.error(
+        "No passcode configured. Add `[auth]` with `passcode = \"...\"` to "
+        "`.streamlit/secrets.toml` and restart the app."
+    )
+    st.stop()
+
+
+def _sign(expiry):
+    # The key mixes in the passcode, so changing the passcode instantly
+    # invalidates every cookie that was issued before.
+    key = f"{COOKIE_SECRET}|{PASSCODE}".encode("utf-8")
+    return hmac.new(key, str(expiry).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def make_token():
+    """A signed, expiring token. It contains no passcode, only an expiry time
+    and a signature that can't be forged without COOKIE_SECRET."""
+    expiry = int(time.time()) + REMEMBER_DAYS * 86400
+    return f"{expiry}.{_sign(expiry)}"
+
+
+def token_is_valid(token):
+    try:
+        expiry_str, signature = str(token).split(".", 1)
+        expiry = int(expiry_str)
+    except ValueError:
+        return False
+    return expiry > time.time() and hmac.compare_digest(signature, _sign(expiry))
+
+
+def run_cookie_script(js):
+    """Run a snippet in a zero-height iframe that has same-origin access to the
+    app page, which is how a cookie is written or cleared from Streamlit."""
+    html = f"<script>{js}</script>"
+    if hasattr(st, "iframe"):  # newer Streamlit; components.html is deprecated there
+        st.iframe(html, height=1)
+    else:
+        import streamlit.components.v1 as components
+
+        components.html(html, height=0)
+
+
+def set_auth_cookie():
+    run_cookie_script(
+        "const p = window.parent;"
+        f"p.document.cookie = '{COOKIE_NAME}={make_token()}; max-age={REMEMBER_DAYS * 86400}; "
+        "path=/; SameSite=Lax' + (p.location.protocol === 'https:' ? '; Secure' : '');"
+    )
+
+
+def clear_auth_cookie():
+    run_cookie_script(
+        f"window.parent.document.cookie = '{COOKIE_NAME}=; max-age=0; path=/; SameSite=Lax';"
+    )
+
+
+if "unlocked" not in st.session_state:
+    st.session_state.unlocked = False
+    st.session_state.logged_out = False  # ignore the browser's old cookie after an explicit lock
+
+# Returning visitor (e.g. after a page refresh): the browser sends its cookies
+# with the very first request, so a valid token unlocks the app immediately.
+if COOKIE_SECRET and not st.session_state.unlocked and not st.session_state.logged_out:
+    if token_is_valid(st.context.cookies.get(COOKIE_NAME, "")):
+        st.session_state.unlocked = True
+
+# Cookie writes happen on the run *after* the click that caused them, because
+# the script is interrupted by st.rerun() before the browser could execute it.
+pending_cookie = st.session_state.pop("pending_cookie", None)
+if pending_cookie == "set":
+    set_auth_cookie()
+elif pending_cookie == "clear":
+    clear_auth_cookie()
+
+if not st.session_state.unlocked:
+    st.title(APP_TITLE)
+    st.markdown("🔒 This app is protected. Please request the passcode from the admin to continue.")
+    with st.form("unlock_form"):
+        entered = st.text_input("Passcode", type="password")
+        remember = False
+        if COOKIE_SECRET:
+            remember = st.checkbox(f"Keep me signed in on this device ({REMEMBER_DAYS} days)", value=True)
+        if st.form_submit_button("Unlock"):
+            if hmac.compare_digest(entered.encode("utf-8"), str(PASSCODE).encode("utf-8")):
+                st.session_state.unlocked = True
+                st.session_state.logged_out = False
+                if remember:
+                    st.session_state.pending_cookie = "set"
+                st.rerun()
+            else:
+                st.error("Incorrect passcode.")
+    st.stop()
+
+def lock_app():
+    # Runs as a button callback, i.e. before the page reruns, which is the only
+    # moment a widget's own state (the Manage data toggle) may be changed.
+    st.session_state.unlocked = False
+    st.session_state.logged_out = True
+    st.session_state.pending_cookie = "clear"
+    st.session_state.show_manage = False
+
+
+# Header row: title on the left; the Manage data toggle and Lock button on the right.
+header_title, header_toggle, header_lock = st.columns([5, 2, 1.6], vertical_alignment="center")
+header_title.title(APP_TITLE)
+show_manage = header_toggle.toggle(
+    "⚙️ Manage data", key="show_manage", help="Show the panel to add, edit or delete people."
+)
+header_lock.button("🔒 Lock app", on_click=lock_app, use_container_width=True)
 
 st.markdown(
     """
-    Data is loaded live and can be edited directly from this app (add, update, or remove people). 
-    
-    To perform these tasks, please request the passcode from the admin 
-
+    Data is loaded live and can be edited directly from this app (add, update, or remove people).
     """
 )
 
@@ -216,211 +349,190 @@ def current_root_count(dframe):
     return int(dframe["ParentID"].isna().sum())
 
 # ---------------------------------------------------------------------------
-# Sidebar: CRUD — manage people
+# Page layout: the tree on the left and, only while the "Manage data" toggle is
+# on, a panel on the right for adding, editing and deleting people.
 # ---------------------------------------------------------------------------
-st.sidebar.divider()
-st.sidebar.header("Manage Data")
-
-EDIT_PASSCODE = st.secrets.get("auth", {}).get("passcode", None)
-
-if "editing_unlocked" not in st.session_state:
-    st.session_state.editing_unlocked = False
-
-if EDIT_PASSCODE is None:
-    st.sidebar.warning(
-        "No passcode configured (add `[auth] passcode = \"...\"` to secrets.toml) — "
-        "editing is open to everyone."
-    )
-    st.session_state.editing_unlocked = True
-elif not st.session_state.editing_unlocked:
-    entered = st.sidebar.text_input("Enter passcode to edit", type="password", key="passcode_input")
-    if st.sidebar.button("Unlock editing"):
-        if entered == EDIT_PASSCODE:
-            st.session_state.editing_unlocked = True
-            st.rerun()
-        else:
-            st.sidebar.error("Incorrect passcode.")
-
-if not st.session_state.editing_unlocked:
-    st.sidebar.info("Viewing is open to everyone. Enter the passcode above to add, edit, or delete people.")
+if show_manage:
+    main_col, side_col = st.columns([5, 2], gap="large")
 else:
-    if EDIT_PASSCODE is not None:
-        st.sidebar.success("Editing unlocked.")
-        if st.sidebar.button("Lock editing"):
-            st.session_state.editing_unlocked = False
-            st.rerun()
+    main_col = st.container()
+    side_col = None
 
-    name_options = df["Name"].tolist()
+if show_manage:
+    with side_col:
+        with st.container(border=True):
+            name_options = df["Name"].tolist()
 
-    add_tab, edit_tab, delete_tab = st.sidebar.tabs(["➕ Add", "✏️ Edit", "🗑️ Delete"])
+            st.subheader("Manage Data")
+            add_tab, edit_tab, delete_tab = st.tabs(["➕ Add", "✏️ Edit", "🗑️ Delete"])
 
-    with add_tab:
-        with st.form("add_person_form", clear_on_submit=True):
-            st.write("Add a new person")
-            next_id = int(df["ID"].max()) + 1 if not df.empty else 1
-            st.caption(f"ID will be auto-assigned: **{next_id}**")
-            new_name = st.text_input("Name")
-            new_age = st.number_input("Age", min_value=0, max_value=130, value=30, step=1)
-            root_count = current_root_count(df)
-            add_parent_options = name_options.copy()
-            if root_count < ROOT_LIMIT:
-                add_parent_options = ["None (root)"] + add_parent_options
-            else:
-                st.caption(
-                    f"Root limit reached ({ROOT_LIMIT} root ancestors already set) — "
-                    "new people must be assigned a parent."
-                )
-            new_parent = st.selectbox("Parent", options=add_parent_options, key="add_parent")
-            new_gender = st.selectbox("Gender", options=GENDER_OPTIONS, key="add_gender")
-            new_employment = st.selectbox("Employment status", options=EMPLOYMENT_OPTIONS, key="add_employment")
-            new_city = st.text_input("City", key="add_city")
-            new_marital = st.selectbox("Marital status", options=MARITAL_OPTIONS, key="add_marital")
-            new_spouse = st.text_input("Spouse's name (if married)", key="add_spouse")
-            submitted = st.form_submit_button("Add person")
-            if submitted:
-                if not new_name.strip():
-                    st.warning("Name is required.")
-                elif new_parent == "None (root)" and current_root_count(df) >= ROOT_LIMIT:
-                    # Re-check at submit time in case the sheet changed since the
-                    # form was rendered (e.g. someone else added a root in between).
-                    st.error(f"Only {ROOT_LIMIT} root ancestors are allowed. Please choose a parent.")
-                else:
-                    # Re-derive the next ID at submit time in case the sheet changed
-                    # since the form was rendered.
-                    new_id = int(df["ID"].max()) + 1 if not df.empty else 1
-                    parent_id = None
-                    if new_parent != "None (root)":
-                        parent_id = df.loc[df["Name"] == new_parent, "ID"].iloc[0]
-                    spouse_val = new_spouse.strip() if new_marital == "Married" else ""
-                    try:
-                        add_person(
-                            worksheet, header, new_id, new_name.strip(), new_age, parent_id,
-                            new_gender, new_employment, new_city.strip(), new_marital, spouse_val,
-                        )
-                        st.success(f"Added {new_name}.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Couldn't add person: {e}")
-
-    with edit_tab:
-        if df.empty:
-            st.write("No people to edit yet.")
-        else:
-            edit_name = st.selectbox("Select a person to edit", options=df["Name"].tolist(), key="edit_select")
-            edit_row = df[df["Name"] == edit_name].iloc[0]
-            with st.form("edit_person_form"):
-                edited_name = st.text_input("Name", value=edit_row["Name"])
-                edited_age = st.number_input(
-                    "Age", min_value=0, max_value=130,
-                    value=int(edit_row["Age"]) if pd.notna(edit_row["Age"]) else 0, step=1,
-                )
-                current_parent_name = "None (root)"
-                is_currently_root = pd.isna(edit_row["ParentID"])
-                if not is_currently_root:
-                    match = df[df["ID"] == edit_row["ParentID"]]
-                    if not match.empty:
-                        current_parent_name = match.iloc[0]["Name"]
-                allow_root_option = is_currently_root or (current_root_count(df) < ROOT_LIMIT)
-                parent_choices = [n for n in name_options if n != edit_name]
-                if allow_root_option:
-                    parent_choices = ["None (root)"] + parent_choices
-                elif current_parent_name == "None (root)":
-                    # Shouldn't happen (is_currently_root already covers this), but
-                    # guard against an inconsistent default_index lookup below.
-                    current_parent_name = parent_choices[0] if parent_choices else "None (root)"
-                default_index = parent_choices.index(current_parent_name) if current_parent_name in parent_choices else 0
-                edited_parent = st.selectbox("Parent", options=parent_choices, index=default_index, key="edit_parent")
-                if not allow_root_option:
-                    st.caption(
-                        f"Root limit reached ({ROOT_LIMIT} root ancestors already set) — "
-                        "this person must have a parent."
-                    )
-
-                gender_index = GENDER_OPTIONS.index(edit_row["Gender"]) if edit_row["Gender"] in GENDER_OPTIONS else 0
-                edited_gender = st.selectbox("Gender", options=GENDER_OPTIONS, index=gender_index, key="edit_gender")
-
-                employment_index = (
-                    EMPLOYMENT_OPTIONS.index(edit_row["EmploymentStatus"])
-                    if edit_row["EmploymentStatus"] in EMPLOYMENT_OPTIONS else 0
-                )
-                edited_employment = st.selectbox(
-                    "Employment status", options=EMPLOYMENT_OPTIONS, index=employment_index, key="edit_employment"
-                )
-
-                edited_city = st.text_input("City", value=edit_row["City"], key="edit_city")
-
-                marital_index = (
-                    MARITAL_OPTIONS.index(edit_row["MaritalStatus"])
-                    if edit_row["MaritalStatus"] in MARITAL_OPTIONS else 0
-                )
-                edited_marital = st.selectbox("Marital status", options=MARITAL_OPTIONS, index=marital_index, key="edit_marital")
-                edited_spouse = st.text_input("Spouse's name (if married)", value=edit_row["Spouse"], key="edit_spouse")
-
-                save = st.form_submit_button("Save changes")
-                if save:
-                    would_be_new_root = edited_parent == "None (root)" and not is_currently_root
-                    if would_be_new_root and current_root_count(df) >= ROOT_LIMIT:
-                        st.error(f"Only {ROOT_LIMIT} root ancestors are allowed. Please choose a parent.")
+            with add_tab:
+                with st.form("add_person_form", clear_on_submit=True):
+                    st.write("Add a new person")
+                    next_id = int(df["ID"].max()) + 1 if not df.empty else 1
+                    st.caption(f"ID will be auto-assigned: **{next_id}**")
+                    new_name = st.text_input("Name")
+                    new_age = st.number_input("Age", min_value=0, max_value=130, value=30, step=1)
+                    root_count = current_root_count(df)
+                    add_parent_options = name_options.copy()
+                    if root_count < ROOT_LIMIT:
+                        add_parent_options = ["None (root)"] + add_parent_options
                     else:
-                        parent_id = None
-                        if edited_parent != "None (root)":
-                            parent_id = df.loc[df["Name"] == edited_parent, "ID"].iloc[0]
-                        spouse_val = edited_spouse.strip() if edited_marital == "Married" else ""
-                        row_num = row_number_for_id(worksheet, header, edit_row["ID"])
-                        if row_num is None:
-                            st.error("Couldn't locate that row in the sheet.")
+                        st.caption(
+                            f"Root limit reached ({ROOT_LIMIT} root ancestors already set) — "
+                            "new people must be assigned a parent."
+                        )
+                    new_parent = st.selectbox("Parent", options=add_parent_options, key="add_parent")
+                    new_gender = st.selectbox("Gender", options=GENDER_OPTIONS, key="add_gender")
+                    new_employment = st.selectbox("Employment status", options=EMPLOYMENT_OPTIONS, key="add_employment")
+                    new_city = st.text_input("City", key="add_city")
+                    new_marital = st.selectbox("Marital status", options=MARITAL_OPTIONS, key="add_marital")
+                    new_spouse = st.text_input("Spouse's name (if married)", key="add_spouse")
+                    submitted = st.form_submit_button("Add person")
+                    if submitted:
+                        if not new_name.strip():
+                            st.warning("Name is required.")
+                        elif new_parent == "None (root)" and current_root_count(df) >= ROOT_LIMIT:
+                            # Re-check at submit time in case the sheet changed since the
+                            # form was rendered (e.g. someone else added a root in between).
+                            st.error(f"Only {ROOT_LIMIT} root ancestors are allowed. Please choose a parent.")
                         else:
+                            # Re-derive the next ID at submit time in case the sheet changed
+                            # since the form was rendered.
+                            new_id = int(df["ID"].max()) + 1 if not df.empty else 1
+                            parent_id = None
+                            if new_parent != "None (root)":
+                                parent_id = df.loc[df["Name"] == new_parent, "ID"].iloc[0]
+                            spouse_val = new_spouse.strip() if new_marital == "Married" else ""
                             try:
-                                update_person(
-                                    worksheet, header, row_num, edited_name.strip(), edited_age, parent_id,
-                                    edited_gender, edited_employment, edited_city.strip(), edited_marital, spouse_val,
+                                add_person(
+                                    worksheet, header, new_id, new_name.strip(), new_age, parent_id,
+                                    new_gender, new_employment, new_city.strip(), new_marital, spouse_val,
                                 )
-                                st.success(f"Updated {edited_name}.")
+                                st.success(f"Added {new_name}.")
                                 st.rerun()
                             except Exception as e:
-                                st.error(f"Couldn't update person: {e}")
+                                st.error(f"Couldn't add person: {e}")
 
-    with delete_tab:
-        deletable_df = df[df["ParentID"].notna()]
-        if df.empty:
-            st.write("No people to delete yet.")
-        elif deletable_df.empty:
-            st.write(
-                "Only root ancestors remain — they can't be deleted, only edited."
-            )
-        else:
-            st.caption("Root ancestors can't be deleted here — edit them instead.")
-            delete_name = st.selectbox(
-                "Select a person to delete", options=deletable_df["Name"].tolist(), key="delete_select"
-            )
-            delete_row = deletable_df[deletable_df["Name"] == delete_name].iloc[0]
-            has_children = not df[df["ParentID"] == delete_row["ID"]].empty
-            if has_children:
-                st.warning(
-                    "This person has children in the tree. Deleting them will leave "
-                    "those children without a parent (they'll become roots)."
-                )
-            if st.button("Delete person", type="primary"):
-                if pd.isna(delete_row["ParentID"]):
-                    # Shouldn't be reachable since roots are excluded from the
-                    # dropdown above, but guard against a stale selection anyway.
-                    st.error("Root ancestors can't be deleted — edit them instead.")
+            with edit_tab:
+                if df.empty:
+                    st.write("No people to edit yet.")
                 else:
-                    row_num = row_number_for_id(worksheet, header, delete_row["ID"])
-                    if row_num is None:
-                        st.error("Couldn't locate that row in the sheet.")
-                    else:
-                        try:
-                            delete_person(worksheet, row_num)
-                            st.success(f"Deleted {delete_name}.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Couldn't delete person: {e}")
+                    edit_name = st.selectbox("Select a person to edit", options=df["Name"].tolist(), key="edit_select")
+                    edit_row = df[df["Name"] == edit_name].iloc[0]
+                    with st.form("edit_person_form"):
+                        edited_name = st.text_input("Name", value=edit_row["Name"])
+                        edited_age = st.number_input(
+                            "Age", min_value=0, max_value=130,
+                            value=int(edit_row["Age"]) if pd.notna(edit_row["Age"]) else 0, step=1,
+                        )
+                        current_parent_name = "None (root)"
+                        is_currently_root = pd.isna(edit_row["ParentID"])
+                        if not is_currently_root:
+                            match = df[df["ID"] == edit_row["ParentID"]]
+                            if not match.empty:
+                                current_parent_name = match.iloc[0]["Name"]
+                        allow_root_option = is_currently_root or (current_root_count(df) < ROOT_LIMIT)
+                        parent_choices = [n for n in name_options if n != edit_name]
+                        if allow_root_option:
+                            parent_choices = ["None (root)"] + parent_choices
+                        elif current_parent_name == "None (root)":
+                            # Shouldn't happen (is_currently_root already covers this), but
+                            # guard against an inconsistent default_index lookup below.
+                            current_parent_name = parent_choices[0] if parent_choices else "None (root)"
+                        default_index = parent_choices.index(current_parent_name) if current_parent_name in parent_choices else 0
+                        edited_parent = st.selectbox("Parent", options=parent_choices, index=default_index, key="edit_parent")
+                        if not allow_root_option:
+                            st.caption(
+                                f"Root limit reached ({ROOT_LIMIT} root ancestors already set) — "
+                                "this person must have a parent."
+                            )
+
+                        gender_index = GENDER_OPTIONS.index(edit_row["Gender"]) if edit_row["Gender"] in GENDER_OPTIONS else 0
+                        edited_gender = st.selectbox("Gender", options=GENDER_OPTIONS, index=gender_index, key="edit_gender")
+
+                        employment_index = (
+                            EMPLOYMENT_OPTIONS.index(edit_row["EmploymentStatus"])
+                            if edit_row["EmploymentStatus"] in EMPLOYMENT_OPTIONS else 0
+                        )
+                        edited_employment = st.selectbox(
+                            "Employment status", options=EMPLOYMENT_OPTIONS, index=employment_index, key="edit_employment"
+                        )
+
+                        edited_city = st.text_input("City", value=edit_row["City"], key="edit_city")
+
+                        marital_index = (
+                            MARITAL_OPTIONS.index(edit_row["MaritalStatus"])
+                            if edit_row["MaritalStatus"] in MARITAL_OPTIONS else 0
+                        )
+                        edited_marital = st.selectbox("Marital status", options=MARITAL_OPTIONS, index=marital_index, key="edit_marital")
+                        edited_spouse = st.text_input("Spouse's name (if married)", value=edit_row["Spouse"], key="edit_spouse")
+
+                        save = st.form_submit_button("Save changes")
+                        if save:
+                            would_be_new_root = edited_parent == "None (root)" and not is_currently_root
+                            if would_be_new_root and current_root_count(df) >= ROOT_LIMIT:
+                                st.error(f"Only {ROOT_LIMIT} root ancestors are allowed. Please choose a parent.")
+                            else:
+                                parent_id = None
+                                if edited_parent != "None (root)":
+                                    parent_id = df.loc[df["Name"] == edited_parent, "ID"].iloc[0]
+                                spouse_val = edited_spouse.strip() if edited_marital == "Married" else ""
+                                row_num = row_number_for_id(worksheet, header, edit_row["ID"])
+                                if row_num is None:
+                                    st.error("Couldn't locate that row in the sheet.")
+                                else:
+                                    try:
+                                        update_person(
+                                            worksheet, header, row_num, edited_name.strip(), edited_age, parent_id,
+                                            edited_gender, edited_employment, edited_city.strip(), edited_marital, spouse_val,
+                                        )
+                                        st.success(f"Updated {edited_name}.")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Couldn't update person: {e}")
+
+            with delete_tab:
+                deletable_df = df[df["ParentID"].notna()]
+                if df.empty:
+                    st.write("No people to delete yet.")
+                elif deletable_df.empty:
+                    st.write(
+                        "Only root ancestors remain — they can't be deleted, only edited."
+                    )
+                else:
+                    st.caption("Root ancestors can't be deleted here — edit them instead.")
+                    delete_name = st.selectbox(
+                        "Select a person to delete", options=deletable_df["Name"].tolist(), key="delete_select"
+                    )
+                    delete_row = deletable_df[deletable_df["Name"] == delete_name].iloc[0]
+                    has_children = not df[df["ParentID"] == delete_row["ID"]].empty
+                    if has_children:
+                        st.warning(
+                            "This person has children in the tree. Deleting them will leave "
+                            "those children without a parent (they'll become roots)."
+                        )
+                    if st.button("Delete person", type="primary"):
+                        if pd.isna(delete_row["ParentID"]):
+                            # Shouldn't be reachable since roots are excluded from the
+                            # dropdown above, but guard against a stale selection anyway.
+                            st.error("Root ancestors can't be deleted — edit them instead.")
+                        else:
+                            row_num = row_number_for_id(worksheet, header, delete_row["ID"])
+                            if row_num is None:
+                                st.error("Couldn't locate that row in the sheet.")
+                            else:
+                                try:
+                                    delete_person(worksheet, row_num)
+                                    st.success(f"Deleted {delete_name}.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Couldn't delete person: {e}")
 
 # ---------------------------------------------------------------------------
 # Build the tree recursively
 # ---------------------------------------------------------------------------
-st.subheader("Family Tree")
+main_col.subheader("Family Tree")
 
 valid_ids = set(df["ID"])
 
@@ -487,51 +599,108 @@ def render_person(row, depth=0, visited=None):
         st.markdown(label, unsafe_allow_html=True)
 
 
-if not root_rows:
-    st.warning("No root ancestors found — check that ParentID values are either blank or reference valid IDs.")
-else:
-    for root in sorted(root_rows, key=lambda r: r["Name"]):
+# ---------------------------------------------------------------------------
+# Top-to-bottom family chart (pure HTML/CSS, no extra libraries)
+# ---------------------------------------------------------------------------
+TREE_CSS = """
+<style>
+.ft-scroll{overflow-x:auto;padding:4px 0 10px}
+.ft-tree{--ft-line:rgba(128,128,128,.7);width:max-content;min-width:100%;display:flex;justify-content:center}
+.ft-tree ul{display:flex;justify-content:center;margin:0;padding:20px 0 0;position:relative}
+.ft-tree > ul{padding-top:0}
+.ft-tree li{list-style:none;position:relative;padding:20px 6px 0;text-align:center}
+.ft-tree li:only-child{padding-top:0}
+.ft-tree li::before,.ft-tree li::after{content:"";position:absolute;top:0;right:50%;width:50%;height:20px;border-top:2px solid var(--ft-line)}
+.ft-tree li::after{right:auto;left:50%;border-left:2px solid var(--ft-line)}
+.ft-tree li:only-child::before,.ft-tree li:only-child::after{display:none}
+.ft-tree li:first-child::before,.ft-tree li:last-child::after{border:0 none}
+.ft-tree li:last-child::before{border-right:2px solid var(--ft-line);border-radius:0 6px 0 0}
+.ft-tree li:first-child::after{border-radius:6px 0 0 0}
+.ft-tree ul ul::before{content:"";position:absolute;top:0;left:50%;height:20px;border-left:2px solid var(--ft-line)}
+.ft-unit{display:flex;justify-content:center;align-items:center}
+.ft-card{min-width:190px;max-width:290px;padding:8px 12px;overflow-wrap:anywhere;border-radius:10px;border:1px solid rgba(128,128,128,.4);border-top:4px solid #8a8f98;background:rgba(128,128,128,.10);font-size:.82rem;line-height:1.35;text-align:center}
+.ft-male{border-top-color:#4c8dff}
+.ft-female{border-top-color:#ec6fa5}
+.ft-other{border-top-color:#8a8f98}
+.ft-name{font-weight:700;font-size:.95rem}
+.ft-meta{opacity:.8}
+.ft-marital{margin-top:4px;font-size:.76rem;font-style:italic;opacity:.9}
+.ft-link{padding:0 8px;color:#e0556b;font-size:1.1rem}
+</style>
+"""
+
+
+def person_card(row):
+    """One person as an HTML card. Every value from the sheet is escaped."""
+    status, spouse = get_marital(row)
+    age = int(row["Age"]) if pd.notna(row["Age"]) else "N/A"
+    gender = row["Gender"]
+    css = {"Male": "ft-male", "Female": "ft-female"}.get(gender, "ft-other")
+    meta = " · ".join(p for p in [f"Age {age}", gender] if p)
+    work = " · ".join(p for p in [row["EmploymentStatus"], row["City"]] if p)
+    parts = [
+        f'<div class="ft-name">{esc(str(row["Name"]))}</div>',
+        f'<div class="ft-meta">{esc(meta)}</div>',
+    ]
+    if work:
+        parts.append(f'<div class="ft-meta">{esc(work)}</div>')
+    parts.append(f'<div class="ft-marital">{esc(marital_clause(status, spouse))}</div>')
+    return f'<div class="ft-card {css}">{"".join(parts)}</div>'
+
+
+def tree_node(people, visited):
+    """<li> for one person, or for a married couple shown side by side, with
+    all of their children nested below. `visited` guards against cycles."""
+    ids = {p["ID"] for p in people}
+    if ids & visited:
+        return '<li><div class="ft-unit"><div class="ft-card ft-other">⚠ Cycle detected in ParentID data</div></div></li>'
+    visited = visited | ids
+
+    kids = sorted(
+        (k for p in people for k in children_lookup.get(p["ID"], [])),
+        key=lambda r: str(r["Name"]),
+    )
+    unit = '<div class="ft-link">♥</div>'.join(person_card(p) for p in people)
+    out = f'<li><div class="ft-unit">{unit}</div>'
+    if kids:
+        out += "<ul>" + "".join(tree_node([k], visited) for k in kids) + "</ul>"
+    return out + "</li>"
+
+
+def render_tree_diagram(units):
+    for unit in units:
         with st.container(border=True):
-            render_person(root)
+            st.html(
+                TREE_CSS
+                + f'<div class="ft-scroll"><div class="ft-tree"><ul>{tree_node(unit, set())}</ul></div></div>'
+            )
 
-# ---------------------------------------------------------------------------
-# Optional: person detail lookup
-# ---------------------------------------------------------------------------
-st.divider()
-st.subheader("Look Up a Person")
 
-if df.empty:
-    st.write("No people in the sheet yet — add someone using the sidebar.")
-else:
-    selected_name = st.selectbox("Select a person", options=df["Name"].sort_values())
-    person = df[df["Name"] == selected_name].iloc[0]
-
-    parent_name = None
-    if pd.notna(person["ParentID"]) and person["ParentID"] in valid_ids:
-        parent_row = df[df["ID"] == person["ParentID"]]
-        if not parent_row.empty:
-            parent_name = parent_row.iloc[0]["Name"]
-
-    children = df[df["ParentID"] == person["ID"]]["Name"].tolist()
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Name", person["Name"])
-    col2.metric("Age", int(person["Age"]) if pd.notna(person["Age"]) else "N/A")
-    col3.metric("Gender", person["Gender"] or "N/A")
-    col4.metric("Parent", parent_name if parent_name else "None (Root)")
-
-    col5, col6, col7 = st.columns(3)
-    col5.metric("Employment", person["EmploymentStatus"] or "N/A")
-    col6.metric("City", person["City"] or "N/A")
-    person_status, person_spouse = get_marital(person)
-    col7.metric("Marital status", marital_clause(person_status, person_spouse))
-
-    if children:
-        st.write("**Children:**", ", ".join(children))
+with main_col:
+    if not root_rows:
+        st.warning("No root ancestors found — check that ParentID values are either blank or reference valid IDs.")
     else:
-        st.write("**Children:** None")
+        tree_view = st.radio(
+            "Tree view",
+            ["Family chart", "Indented list"],
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+        sorted_roots = sorted(root_rows, key=lambda r: r["Name"])
 
-# ---------------------------------------------------------------------------
-st.divider()
-st.subheader("Tabular Data")
-st.dataframe(df, use_container_width=True)
+        if tree_view == "Family chart":
+            st.caption("Large family? Scroll sideways inside the chart to see every branch.")
+            # The two root ancestors are a couple: draw them side by side at the
+            # top, with the children of either one hanging below them.
+            if len(sorted_roots) == ROOT_LIMIT:
+                render_tree_diagram([sorted_roots])
+            else:
+                render_tree_diagram([[r] for r in sorted_roots])
+        else:
+            for root in sorted_roots:
+                with st.container(border=True):
+                    render_person(root)
+
+    st.divider()
+    st.subheader("Tabular Data")
+    st.dataframe(df, use_container_width=True)
