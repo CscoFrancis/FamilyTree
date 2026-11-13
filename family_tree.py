@@ -2,11 +2,13 @@ import hashlib
 import hmac
 import re
 import time
+from datetime import date, datetime, timedelta
 from html import escape as esc
 import numpy as np
 import pandas as pd
 import streamlit as st
 import gspread
+from gspread.utils import ValueRenderOption
 from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Family Tree Viewer", layout="wide")
@@ -143,7 +145,7 @@ header_title.title(APP_TITLE)
 show_manage = header_toggle.toggle(
     "⚙️ Manage data", key="show_manage", help="Show the panel to add, edit or delete people."
 )
-header_lock.button("🔒 Lock app", on_click=lock_app, use_container_width=True)
+header_lock.button("🔒 Lock app", on_click=lock_app, width="stretch")
 
 st.markdown(
     """
@@ -155,17 +157,20 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
-DEFAULT_SHEET_URL = (
-    "https://docs.google.com/spreadsheets/d/"
-    "1GGMarbxQ7XNC5qcUO_3iIWdcGMP27V4OETGRaWEBMgk/edit?gid=0#gid=0"
-)
 REQUIRED_COLS = [
-    "ID", "Name", "Age", "ParentID",
+    "ID", "Name", "DOB", "ParentID",
     "Gender", "EmploymentStatus", "City", "MaritalStatus", "Spouse",
 ]
 GENDER_OPTIONS = ["Male", "Female"]
 EMPLOYMENT_OPTIONS = ["Student", "Self-employed", "Employed", "Unemployed"]
 MARITAL_OPTIONS = ["Not yet married", "Married", "Divorced", "Widowed"]
+
+# Ages are worked out from the date of birth, using "today" in this timezone.
+APP_TIMEZONE = "Africa/Nairobi"
+# Earliest date of birth the app accepts. Anything earlier is treated as unreadable,
+# because a bare number in the DOB column (an old age like 50, or a year like 1948)
+# would otherwise be read by Google Sheets as a date in 1899-1905.
+DOB_MIN = date(1910, 1, 1)
 
 
 def parse_sheet_url(url):
@@ -205,7 +210,9 @@ def get_worksheet(file_id, gid):
 
 
 def load_dataframe(worksheet):
-    records = worksheet.get_all_records()
+    # UNFORMATTED_VALUE returns dates as serial numbers, so a date shown as
+    # 03/04/1990 can't be misread as 4 March when it is really 3 April.
+    records = worksheet.get_all_records(value_render_option=ValueRenderOption.unformatted)
     df = pd.DataFrame(records)
     return df
 
@@ -242,12 +249,77 @@ def to_native(val):
     return val
 
 
-def add_person(worksheet, header, id_val, name, age, parent_id, gender,
+def today_local():
+    """Today's date in the app's timezone (the hosting server runs in UTC, which
+    would make birthdays tick over up to 3 hours late for Nairobi)."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo(APP_TIMEZONE)).date()
+    except Exception:
+        return date.today()
+
+
+_TEXT_DATE_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d %b %Y", "%d %B %Y")
+_SHEETS_EPOCH = date(1899, 12, 30)  # day 0 of a Google Sheets date serial
+
+
+def parse_dob(value, today):
+    """Turn whatever is in a DOB cell into a date.
+
+    Returns (date or None, unreadable). A blank cell is (None, False); something
+    in the cell that isn't a sensible date of birth is (None, True)."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None, False
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None, False
+        parsed = None
+        for fmt in _TEXT_DATE_FORMATS:
+            try:
+                parsed = datetime.strptime(text, fmt).date()
+                break
+            except ValueError:
+                continue
+    elif isinstance(value, bool):
+        return None, True
+    elif isinstance(value, (int, float, np.integer, np.floating)):
+        try:
+            parsed = _SHEETS_EPOCH + timedelta(days=int(value))  # a real date cell
+        except (OverflowError, ValueError):
+            parsed = None
+    else:
+        parsed = None
+    if parsed is None or parsed < DOB_MIN or parsed > today:
+        return None, True
+    return parsed, False
+
+
+def age_on(dob, today):
+    """Whole years between dob and today (None if dob is missing)."""
+    if dob is None:
+        return None
+    return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+
+
+def age_text(age):
+    if age is None or pd.isna(age):
+        return "N/A"
+    return "<1" if int(age) == 0 else str(int(age))
+
+
+def dob_to_cell(dob):
+    """What gets written to the sheet: an ISO date (Sheets stores it as a real date)."""
+    return dob.isoformat() if dob else ""
+
+
+def add_person(worksheet, header, id_val, name, dob, parent_id, gender,
                employment_status, city, marital_status, spouse):
     row_dict = {
         "ID": id_val,
         "Name": name,
-        "Age": age,
+        "DOB": dob_to_cell(dob),
         "ParentID": parent_id,
         "Gender": gender,
         "EmploymentStatus": employment_status,
@@ -259,11 +331,11 @@ def add_person(worksheet, header, id_val, name, age, parent_id, gender,
     worksheet.append_row(row, value_input_option="USER_ENTERED")
 
 
-def update_person(worksheet, header, row_num, name, age, parent_id, gender,
+def update_person(worksheet, header, row_num, name, dob, parent_id, gender,
                    employment_status, city, marital_status, spouse):
     row_dict = {
         "Name": name,
-        "Age": age,
+        "DOB": dob_to_cell(dob),
         "ParentID": parent_id,
         "Gender": gender,
         "EmploymentStatus": employment_status,
@@ -295,10 +367,21 @@ if "connections" not in st.secrets or "gsheets" not in st.secrets["connections"]
     )
     st.stop()
 
-sheet_url = st.secrets["connections"]["gsheets"].get("spreadsheet", DEFAULT_SHEET_URL)
+gsheets_secrets = st.secrets["connections"]["gsheets"]
+service_email = gsheets_secrets.get("client_email", "(client_email missing from secrets)")
+
+sheet_url = gsheets_secrets.get("spreadsheet")
+if not sheet_url:
+    st.error(
+        "No `spreadsheet` address found in your secrets. Add a line like "
+        "`spreadsheet = \"https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit?gid=0\"` "
+        "inside the `[connections.gsheets]` section (not under `[auth]`)."
+    )
+    st.stop()
+
 file_id, gid = parse_sheet_url(sheet_url)
 if not file_id:
-    st.error("Couldn't parse a Google Sheet ID from that URL.")
+    st.error("Couldn't parse a Google Sheet ID from the `spreadsheet` address in your secrets.")
     st.stop()
 
 try:
@@ -306,18 +389,58 @@ try:
     df = load_dataframe(worksheet)
     header = get_header(worksheet)
 except Exception as e:
+    kind = type(e).__name__
+    # gspread turns Google's "403 access refused" into a bare PermissionError with
+    # no text; Google's own explanation is on the exception it was raised from.
+    cause = str(e.__cause__).strip() if e.__cause__ else ""
+    detail = str(e).strip() or cause or "Google gave no further detail"
+    if kind == "PermissionError":
+        hint = (
+            "Google refused access (HTTP 403). The most likely cause is that this sheet isn't "
+            "shared with the service account below as **Editor**. If the detail says the "
+            "Google Sheets API is disabled, enable it for that service account's project."
+        )
+    elif kind == "SpreadsheetNotFound":
+        hint = (
+            "The sheet wasn't found. Either the sheet ID is wrong, or this sheet isn't shared "
+            "with the service account below."
+        )
+    else:
+        hint = (
+            "Make sure the sheet is shared with the service account below as Editor, and that "
+            "the Google Sheets API is enabled for its project."
+        )
     st.error(
-        "Couldn't load that sheet. Make sure it's shared with your service "
-        f"account's email with at least Editor access. Error: {e}"
+        f"Couldn't load the sheet. {hint}\n\n"
+        f"- **Error:** {kind}: {detail}\n"
+        f"- **Sheet ID the app is using:** `{file_id}`\n"
+        f"- **Service account it signs in as:** `{service_email}`"
     )
     st.stop()
 
 # ---------------------------------------------------------------------------
 # Validate required columns
 # ---------------------------------------------------------------------------
+if "DOB" not in df.columns and "Age" in df.columns:
+    st.error(
+        "Your sheet still has an **Age** column. Rename that header to **DOB** (date of birth) "
+        "and enter each person's date of birth, e.g. `1990-03-15`. The app works out ages by itself."
+    )
+    st.stop()
 if not set(REQUIRED_COLS).issubset(df.columns):
     st.error(f"Your sheet must contain these columns: {REQUIRED_COLS}")
     st.stop()
+
+# Dates of birth -> real dates; ages are always calculated, never stored.
+TODAY = today_local()
+_parsed = [parse_dob(v, TODAY) for v in df["DOB"]]
+bad_dob = [
+    (str(name), str(raw))
+    for name, raw, (_, bad) in zip(df["Name"], df["DOB"], _parsed)
+    if bad
+]
+df["DOB"] = pd.Series([d for d, _ in _parsed], index=df.index, dtype="object")
+df["Age"] = pd.Series([age_on(d, TODAY) for d, _ in _parsed], index=df.index, dtype="Int64")
 
 # Normalize ParentID: blanks / 0 / -1 all mean "no parent"
 def normalize_parent(val):
@@ -372,7 +495,11 @@ if show_manage:
                     next_id = int(df["ID"].max()) + 1 if not df.empty else 1
                     st.caption(f"ID will be auto-assigned: **{next_id}**")
                     new_name = st.text_input("Name")
-                    new_age = st.number_input("Age", min_value=0, max_value=130, value=30, step=1)
+                    new_dob = st.date_input(
+                        "Date of birth", value=None, min_value=DOB_MIN, max_value=TODAY,
+                        format="DD/MM/YYYY", key="add_dob",
+                        help="Age is worked out automatically from this date.",
+                    )
                     root_count = current_root_count(df)
                     add_parent_options = name_options.copy()
                     if root_count < ROOT_LIMIT:
@@ -406,7 +533,7 @@ if show_manage:
                             spouse_val = new_spouse.strip() if new_marital == "Married" else ""
                             try:
                                 add_person(
-                                    worksheet, header, new_id, new_name.strip(), new_age, parent_id,
+                                    worksheet, header, new_id, new_name.strip(), new_dob, parent_id,
                                     new_gender, new_employment, new_city.strip(), new_marital, spouse_val,
                                 )
                                 st.success(f"Added {new_name}.")
@@ -420,11 +547,18 @@ if show_manage:
                 else:
                     edit_name = st.selectbox("Select a person to edit", options=df["Name"].tolist(), key="edit_select")
                     edit_row = df[df["Name"] == edit_name].iloc[0]
+                    # Every widget key carries the person's ID: with a fixed key Streamlit keeps the
+                    # previous person's value when you switch people, and Save would then write
+                    # that stale value onto the newly selected person.
+                    edit_id = int(edit_row["ID"])
                     with st.form("edit_person_form"):
                         edited_name = st.text_input("Name", value=edit_row["Name"])
-                        edited_age = st.number_input(
-                            "Age", min_value=0, max_value=130,
-                            value=int(edit_row["Age"]) if pd.notna(edit_row["Age"]) else 0, step=1,
+                        edited_dob = st.date_input(
+                            "Date of birth",
+                            value=edit_row["DOB"] if edit_row["DOB"] is not None and pd.notna(edit_row["DOB"]) else None,
+                            min_value=DOB_MIN, max_value=TODAY, format="DD/MM/YYYY",
+                            key=f"edit_dob_{edit_id}",
+                            help="Age is worked out automatically from this date.",
                         )
                         current_parent_name = "None (root)"
                         is_currently_root = pd.isna(edit_row["ParentID"])
@@ -441,7 +575,7 @@ if show_manage:
                             # guard against an inconsistent default_index lookup below.
                             current_parent_name = parent_choices[0] if parent_choices else "None (root)"
                         default_index = parent_choices.index(current_parent_name) if current_parent_name in parent_choices else 0
-                        edited_parent = st.selectbox("Parent", options=parent_choices, index=default_index, key="edit_parent")
+                        edited_parent = st.selectbox("Parent", options=parent_choices, index=default_index, key=f"edit_parent_{edit_id}")
                         if not allow_root_option:
                             st.caption(
                                 f"Root limit reached ({ROOT_LIMIT} root ancestors already set) — "
@@ -449,24 +583,24 @@ if show_manage:
                             )
 
                         gender_index = GENDER_OPTIONS.index(edit_row["Gender"]) if edit_row["Gender"] in GENDER_OPTIONS else 0
-                        edited_gender = st.selectbox("Gender", options=GENDER_OPTIONS, index=gender_index, key="edit_gender")
+                        edited_gender = st.selectbox("Gender", options=GENDER_OPTIONS, index=gender_index, key=f"edit_gender_{edit_id}")
 
                         employment_index = (
                             EMPLOYMENT_OPTIONS.index(edit_row["EmploymentStatus"])
                             if edit_row["EmploymentStatus"] in EMPLOYMENT_OPTIONS else 0
                         )
                         edited_employment = st.selectbox(
-                            "Employment status", options=EMPLOYMENT_OPTIONS, index=employment_index, key="edit_employment"
+                            "Employment status", options=EMPLOYMENT_OPTIONS, index=employment_index, key=f"edit_employment_{edit_id}"
                         )
 
-                        edited_city = st.text_input("City", value=edit_row["City"], key="edit_city")
+                        edited_city = st.text_input("City", value=edit_row["City"], key=f"edit_city_{edit_id}")
 
                         marital_index = (
                             MARITAL_OPTIONS.index(edit_row["MaritalStatus"])
                             if edit_row["MaritalStatus"] in MARITAL_OPTIONS else 0
                         )
-                        edited_marital = st.selectbox("Marital status", options=MARITAL_OPTIONS, index=marital_index, key="edit_marital")
-                        edited_spouse = st.text_input("Spouse's name (if married)", value=edit_row["Spouse"], key="edit_spouse")
+                        edited_marital = st.selectbox("Marital status", options=MARITAL_OPTIONS, index=marital_index, key=f"edit_marital_{edit_id}")
+                        edited_spouse = st.text_input("Spouse's name (if married)", value=edit_row["Spouse"], key=f"edit_spouse_{edit_id}")
 
                         save = st.form_submit_button("Save changes")
                         if save:
@@ -484,7 +618,7 @@ if show_manage:
                                 else:
                                     try:
                                         update_person(
-                                            worksheet, header, row_num, edited_name.strip(), edited_age, parent_id,
+                                            worksheet, header, row_num, edited_name.strip(), edited_dob, parent_id,
                                             edited_gender, edited_employment, edited_city.strip(), edited_marital, spouse_val,
                                         )
                                         st.success(f"Updated {edited_name}.")
@@ -579,7 +713,7 @@ def render_person(row, depth=0, visited=None):
     child_rows = children_lookup.get(row["ID"], [])
     indent = "&nbsp;" * 20 * depth
     branch = "└─ " if depth > 0 else ""
-    age_display = int(row["Age"]) if pd.notna(row["Age"]) else "N/A"
+    age_display = age_text(row["Age"])
 
     details = ", ".join(part for part in [row["Gender"], row["EmploymentStatus"], row["City"]] if part)
     status, spouse = get_marital(row)
@@ -633,7 +767,9 @@ TREE_CSS = """
 def person_card(row):
     """One person as an HTML card. Every value from the sheet is escaped."""
     status, spouse = get_marital(row)
-    age = int(row["Age"]) if pd.notna(row["Age"]) else "N/A"
+    age = age_text(row["Age"])
+    born = row["DOB"]
+    born_title = f"Born {born.strftime('%d %b %Y')}" if born is not None and pd.notna(born) else ""
     gender = row["Gender"]
     css = {"Male": "ft-male", "Female": "ft-female"}.get(gender, "ft-other")
     meta = " · ".join(p for p in [f"Age {age}", gender] if p)
@@ -645,7 +781,8 @@ def person_card(row):
     if work:
         parts.append(f'<div class="ft-meta">{esc(work)}</div>')
     parts.append(f'<div class="ft-marital">{esc(marital_clause(status, spouse))}</div>')
-    return f'<div class="ft-card {css}">{"".join(parts)}</div>'
+    title_attr = f' title="{esc(born_title)}"' if born_title else ""
+    return f'<div class="ft-card {css}"{title_attr}>{"".join(parts)}</div>'
 
 
 def tree_node(people, visited):
@@ -677,6 +814,13 @@ def render_tree_diagram(units):
 
 
 with main_col:
+    if bad_dob:
+        shown = ", ".join(f"{n} (\"{r}\")" for n, r in bad_dob[:8])
+        more = f" and {len(bad_dob) - 8} more" if len(bad_dob) > 8 else ""
+        st.warning(
+            f"Couldn't read the date of birth for: {shown}{more}. Use a date like 1990-03-15 "
+            f"or 15/03/1990, on or after {DOB_MIN:%d/%m/%Y}. Their age shows as N/A until then."
+        )
     if not root_rows:
         st.warning("No root ancestors found — check that ParentID values are either blank or reference valid IDs.")
     else:
@@ -703,4 +847,9 @@ with main_col:
 
     st.divider()
     st.subheader("Tabular Data")
-    st.dataframe(df, use_container_width=True)
+    table_df = df.copy()
+    table_df["DOB"] = table_df["DOB"].apply(lambda d: d.isoformat() if d is not None and pd.notna(d) else "")
+    columns = list(table_df.columns)
+    columns.remove("Age")
+    columns.insert(columns.index("DOB") + 1, "Age")
+    st.dataframe(table_df[columns], width="stretch")
