@@ -171,6 +171,8 @@ APP_TIMEZONE = "Africa/Nairobi"
 # because a bare number in the DOB column (an old age like 50, or a year like 1948)
 # would otherwise be read by Google Sheets as a date in 1899-1905.
 DOB_MIN = date(1910, 1, 1)
+# Birthdays this many days ahead (or sooner) are highlighted and listed.
+BIRTHDAY_WINDOW_DAYS = 30
 
 
 def parse_sheet_url(url):
@@ -301,6 +303,27 @@ def age_on(dob, today):
     if dob is None:
         return None
     return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+
+
+def birthday_info(dob, today):
+    """(days until the next birthday, the age they will turn), or (None, None).
+
+    A 29 Feb birthday is celebrated on 1 Mar in years without a 29 Feb, which
+    matches the moment age_on() counts them a year older."""
+    if dob is None:
+        return None, None
+    for year in range(max(today.year, dob.year + 1), today.year + 2):
+        try:
+            nxt = dob.replace(year=year)
+        except ValueError:  # 29 Feb in a non-leap year
+            nxt = date(year, 3, 1)
+        if nxt >= today:
+            return (nxt - today).days, nxt.year - dob.year
+    return None, None
+
+
+def when_text(days):
+    return "Today" if days == 0 else "Tomorrow" if days == 1 else f"In {days} days"
 
 
 def age_text(age):
@@ -441,6 +464,16 @@ bad_dob = [
 ]
 df["DOB"] = pd.Series([d for d, _ in _parsed], index=df.index, dtype="object")
 df["Age"] = pd.Series([age_on(d, TODAY) for d, _ in _parsed], index=df.index, dtype="Int64")
+_bd = [birthday_info(d, TODAY) for d, _ in _parsed]
+df["DaysToBday"] = pd.Series([b[0] for b in _bd], index=df.index, dtype="Int64")
+df["TurningAge"] = pd.Series([b[1] for b in _bd], index=df.index, dtype="Int64")
+upcoming = sorted(
+    (
+        (int(r["DaysToBday"]), str(r["Name"]), int(r["TurningAge"]))
+        for _, r in df.iterrows()
+        if pd.notna(r["DaysToBday"]) and r["DaysToBday"] <= BIRTHDAY_WINDOW_DAYS
+    )
+)
 
 # Normalize ParentID: blanks / 0 / -1 all mean "no parent"
 def normalize_parent(val):
@@ -719,7 +752,12 @@ def render_person(row, depth=0, visited=None):
     status, spouse = get_marital(row)
     marital = marital_clause(status, spouse)
 
-    label = f"{indent}{branch}**{row['Name']}** (Age: {age_display})"
+    born = row["DOB"]
+    born_txt = f", born {born:%d %b %Y}" if born is not None and pd.notna(born) else ""
+    cake = ""
+    if pd.notna(row["DaysToBday"]) and row["DaysToBday"] <= BIRTHDAY_WINDOW_DAYS:
+        cake = f" 🎂 {when_text(int(row['DaysToBday'])).lower()}"
+    label = f"{indent}{branch}**{row['Name']}** (Age: {age_display}{born_txt}){cake}"
     if details:
         label += f" - {details}, ({marital})"
     else:
@@ -759,6 +797,15 @@ TREE_CSS = """
 .ft-name{font-weight:700;font-size:.95rem}
 .ft-meta{opacity:.8}
 .ft-marital{margin-top:4px;font-size:.76rem;font-style:italic;opacity:.9}
+.ft-bday{border-color:#f5a524;box-shadow:0 0 0 2px rgba(245,165,36,.45);background:rgba(245,165,36,.14)}
+.ft-pill{display:inline-block;margin-top:6px;padding:2px 10px;border-radius:999px;background:#f5a524;color:#1b1b1b;font-size:.74rem;font-weight:700}
+.ft-pill-today{background:#e0556b;color:#fff}
+.ft-up{padding:2px 0 6px}
+.ft-up h4{margin:0 0 8px;font-size:1rem}
+.ft-up-row{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;padding:5px 0;border-top:1px solid rgba(128,128,128,.25);font-size:.9rem}
+.ft-up-when{min-width:88px;font-weight:700;color:#d98a00}
+.ft-up-today .ft-up-when{color:#e0556b}
+.ft-up-date{opacity:.7}
 .ft-link{padding:0 8px;color:#e0556b;font-size:1.1rem}
 </style>
 """
@@ -769,9 +816,12 @@ def person_card(row):
     status, spouse = get_marital(row)
     age = age_text(row["Age"])
     born = row["DOB"]
-    born_title = f"Born {born.strftime('%d %b %Y')}" if born is not None and pd.notna(born) else ""
     gender = row["Gender"]
     css = {"Male": "ft-male", "Female": "ft-female"}.get(gender, "ft-other")
+    days = row["DaysToBday"]
+    soon = pd.notna(days) and days <= BIRTHDAY_WINDOW_DAYS
+    if soon:
+        css += " ft-bday"
     meta = " · ".join(p for p in [f"Age {age}", gender] if p)
     work = " · ".join(p for p in [row["EmploymentStatus"], row["City"]] if p)
     parts = [
@@ -780,9 +830,38 @@ def person_card(row):
     ]
     if work:
         parts.append(f'<div class="ft-meta">{esc(work)}</div>')
+    if born is not None and pd.notna(born):
+        parts.append(f'<div class="ft-meta">Born {born:%d %b %Y}</div>')
     parts.append(f'<div class="ft-marital">{esc(marital_clause(status, spouse))}</div>')
-    title_attr = f' title="{esc(born_title)}"' if born_title else ""
-    return f'<div class="ft-card {css}"{title_attr}>{"".join(parts)}</div>'
+    if soon:
+        days = int(days)
+        text = (
+            f"🎂 Birthday today! Turns {int(row['TurningAge'])}"
+            if days == 0
+            else f"🎂 {when_text(days)} · turns {int(row['TurningAge'])}"
+        )
+        pill_css = "ft-pill ft-pill-today" if days == 0 else "ft-pill"
+        parts.append(f'<div><span class="{pill_css}">{esc(text)}</span></div>')
+    return f'<div class="ft-card {css}">{"".join(parts)}</div>'
+
+
+def upcoming_birthdays_html(items):
+    rows = []
+    for days, name, turning in items:
+        when = when_text(days)
+        on = TODAY + timedelta(days=days)
+        today_css = " ft-up-today" if days == 0 else ""
+        rows.append(
+            f'<div class="ft-up-row{today_css}"><span class="ft-up-when">{esc(when)}</span>'
+            f'<span><b>{esc(name)}</b> turns {turning}</span>'
+            f'<span class="ft-up-date">{on:%a %d %b}</span></div>'
+        )
+    return (
+        TREE_CSS
+        + f'<div class="ft-up"><h4>🎂 Upcoming birthdays · next {BIRTHDAY_WINDOW_DAYS} days</h4>'
+        + "".join(rows)
+        + "</div>"
+    )
 
 
 def tree_node(people, visited):
@@ -814,6 +893,9 @@ def render_tree_diagram(units):
 
 
 with main_col:
+    if upcoming:
+        with st.container(border=True):
+            st.html(upcoming_birthdays_html(upcoming))
     if bad_dob:
         shown = ", ".join(f"{n} (\"{r}\")" for n, r in bad_dob[:8])
         more = f" and {len(bad_dob) - 8} more" if len(bad_dob) > 8 else ""
@@ -847,7 +929,7 @@ with main_col:
 
     st.divider()
     st.subheader("Tabular Data")
-    table_df = df.copy()
+    table_df = df.drop(columns=["DaysToBday", "TurningAge"])
     table_df["DOB"] = table_df["DOB"].apply(lambda d: d.isoformat() if d is not None and pd.notna(d) else "")
     columns = list(table_df.columns)
     columns.remove("Age")
